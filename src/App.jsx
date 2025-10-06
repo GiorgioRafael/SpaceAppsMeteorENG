@@ -154,29 +154,8 @@ function App() {
         const bodyText = await res.text()
 
         if (!res.ok) {
-          // Se a rota /api não existir no deploy (ex: Vercel sem serverless), tente a API pública da NASA como fallback
-          try {
-            const apiKey = import.meta.env.VITE_NASA_API_KEY || "XO0W1Kz2NafloPaPFMp2UebjtaOUrZVVWw2bW5Ah"
-            const nasaUrl = `https://api.nasa.gov/neo/rest/v1/feed?start_date=${encodeURIComponent(
-              start,
-            )}&end_date=${encodeURIComponent(end)}&api_key=${apiKey}`
-            const nres = await fetch(nasaUrl)
-            const ntext = await nres.text()
-            if (!nres.ok) throw new Error(`NASA API HTTP ${nres.status} - ${ntext.slice(0, 300)}`)
-            const ndata = ntext ? JSON.parse(ntext) : {}
-            const neo = ndata.near_earth_objects || {}
-            const keys = Object.keys(neo)
-            const list = keys.flatMap((k) => neo[k])
-            setMeteors(list)
-            setCurrentStep(2)
-            setTimeout(() => {
-              meteorSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-            }, 100)
-            return
-          } catch (nerr) {
-            const snippet = bodyText ? ` - ${bodyText.slice(0, 500)}` : ""
-            throw new Error(`HTTP ${res.status} ${res.statusText}${snippet} (fallback failed: ${String(nerr.message).slice(0,200)})`)
-          }
+          const snippet = bodyText ? ` - ${bodyText.slice(0, 500)}` : ""
+          throw new Error(`HTTP ${res.status} ${res.statusText}${snippet}`)
         }
 
         let data
@@ -185,8 +164,7 @@ function App() {
         } catch {
           const snippet = bodyText ? bodyText.slice(0, 500) : "[vazio]"
           const lower = snippet.toLowerCase()
-          // Caso comum local: Vite/preview serve o arquivo de função como estático (JS) — detecte e use o fallback
-          if (lower.includes("<!doctype") || lower.includes("<html") || lower.includes("export default")) {
+          if (lower.includes("<!doctype") || lower.includes("<html")) {
             try {
               const apiKey = import.meta.env.VITE_NASA_API_KEY || "XO0W1Kz2NafloPaPFMp2UebjtaOUrZVVWw2bW5Ah"
               const nasaUrl = `https://api.nasa.gov/neo/rest/v1/feed?start_date=${encodeURIComponent(start)}&end_date=${encodeURIComponent(end)}&api_key=${apiKey}`
@@ -248,6 +226,7 @@ function App() {
     })
 
     setSimulationResults(zones)
+    setCurrentStep(5)
 
     // Compute population estimates only when starting the simulation
     if (zones) {
@@ -258,26 +237,13 @@ function App() {
         moderate: Math.round(effectiveDensity * areaFor(zones.moderateRadius)),
         light: Math.round(effectiveDensity * areaFor(zones.lightRadius)),
       }
-      const pd = {
+      setPopulationData({
         estimates,
         source: isCustomDensity
           ? `Estimativa personalizada: ${customDensity} pessoas/km²`
           : `Template: ${selectedDensityTemplate} (${densityTemplates[selectedDensityTemplate]} pessoas/km²)`,
         confidence: isCustomDensity ? "low" : "medium",
-      }
-      // Set population data, then move to results step so UI shows it reliably
-      setPopulationData(pd)
-      setCurrentStep(5)
-      // Scroll to results for visibility
-      setTimeout(() => {
-        resultsSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-      }, 100)
-      console.log('Simulação completada, estimativas:', pd.estimates)
-      try {
-        toast.success(`Simulação pronta — pessoas afetadas: ${pd.estimates.severe.toLocaleString()} (severa)`)
-      } catch (e) {
-        // toast may not be available in some runtimes; ignore
-      }
+      })
     }
   }
 
@@ -334,26 +300,45 @@ function App() {
     else strength = 2e5
 
     // Altitude de fragmentação aproximada: h = H * ln((rho0 * v^2) / (2 * S))
-  const fragArgument = (rho0 * v * v) / (2 * strength)
-  const hFrag = Math.log(Math.max(fragArgument, 1e-9)) * H // pode ser negativo (sem fragmentação)
-  // Regras mais conservadoras: airburst para objetos bem pequenos e menos densos
-  const likelyAirburst = hFrag > 0 && avgDiameter < 50 && density < 5000
+    const fragArgument = (rho0 * v * v) / (2 * strength)
+    const hFrag = Math.log(Math.max(fragArgument, 1e-9)) * H // pode ser negativo (sem fragmentação)
+    // Airburst desabilitado: sempre considera impacto no solo
+    const likelyAirburst = false
 
-    // 7) Tamanho da cratera via leis de escala π (forma simplificada/gravity regime)
-    //    D_final ~ K * g^-0.17 * (rho_p/rho_t)^0.26 * d^0.78 * (v*sinθ)^0.44
-    //    Coeficiente K ajustado para Terra/alvo rochoso. Ajuste empírico: K ≈ 20 (unidades em metros).
-    const Kc = 20
-    const densityRatio = density / rhoTarget
-    let Dsimple =
-      Kc *
-      Math.pow(g, -0.17) *
-      Math.pow(densityRatio, 0.26) *
-      Math.pow(Math.max(avgDiameter, 0), 0.78) *
-      Math.pow(Math.max(v * sinTheta, 0), 0.44)
-    if (!Number.isFinite(Dsimple)) Dsimple = 0
-    // Correção rudimentar para crateras complexas (> ~3 km): aumenta ~30%
-    let Dfinal = Dsimple > 3000 ? Dsimple * 1.3 : Dsimple
-    let craterRadius = likelyAirburst ? 0 : Dfinal / 2
+    // 7) Tamanho da cratera: ajuste empírico para meteoros pequenos (<10m), incluindo fatores físicos
+    let Dfinal
+    if (avgDiameter < 10) {
+      // Área empírica ajustada, incluindo fatores físicos em menor escala
+      const Kc = 20
+      const densityRatio = density / rhoTarget
+      let Dsimple =
+        Kc *
+        Math.pow(g, -0.17) *
+        Math.pow(densityRatio, 0.26) *
+        Math.pow(Math.max(avgDiameter, 0), 0.78) *
+        Math.pow(Math.max(v * sinTheta, 0), 0.44)
+      if (!Number.isFinite(Dsimple)) Dsimple = 0
+      // Reduz o efeito dos fatores físicos para meteoros pequenos
+      Dsimple = Dsimple / 5
+      // Área empírica baseada em exemplo real
+      const areaCratera = 100 * (avgDiameter / 3.22)
+      // Mistura área empírica e física (média ponderada)
+      const areaFinal = (areaCratera + Math.PI * Math.pow(Dsimple / 2, 2)) / 2
+      Dfinal = 2 * Math.sqrt(areaFinal / Math.PI)
+    } else {
+      // π-scaling para meteoros grandes
+      const Kc = 20
+      const densityRatio = density / rhoTarget
+      let Dsimple =
+        Kc *
+        Math.pow(g, -0.17) *
+        Math.pow(densityRatio, 0.26) *
+        Math.pow(Math.max(avgDiameter, 0), 0.78) *
+        Math.pow(Math.max(v * sinTheta, 0), 0.44)
+      if (!Number.isFinite(Dsimple)) Dsimple = 0
+      Dfinal = Dsimple > 3000 ? Dsimple * 1.3 : Dsimple
+    }
+    let craterRadius = Dfinal / 2
 
     // 8) Zonas de dano por sobrepressão (aproximação R ∝ W^(1/3))
     //    Usamos limiares típicos: 20 psi (severa), 5 psi (moderada), 1 psi (leve),
@@ -425,8 +410,8 @@ function App() {
     <div className="app">
       <header className="app-header">
         <div className="header-content">
-          <h1>🌍 Simulador de Impacto de Asteroide</h1>
-          <p className="subtitle">Simule o impacto de asteroides reais da NASA na Terra</p>
+          <h1>🌍 Asteroid Impact Simulator</h1>
+          <p className="subtitle">Simulate real NASA asteroid impacts on Earth</p>
         </div>
       </header>
 
@@ -434,27 +419,27 @@ function App() {
         <div className="step-indicator">
           <div className={`step-item ${currentStep >= 1 ? "active" : ""} ${currentStep > 1 ? "completed" : ""}`}>
             <div className="step-number">1</div>
-            <div className="step-label">Buscar Meteoros</div>
+            <div className="step-label">Search Asteroids</div>
           </div>
           <div className="step-arrow">→</div>
           <div className={`step-item ${currentStep >= 2 ? "active" : ""} ${currentStep > 2 ? "completed" : ""}`}>
             <div className="step-number">2</div>
-            <div className="step-label">Escolher Meteoro</div>
+            <div className="step-label">Select Asteroid</div>
           </div>
           <div className="step-arrow">→</div>
           <div className={`step-item ${currentStep >= 3 ? "active" : ""} ${currentStep > 3 ? "completed" : ""}`}>
             <div className="step-number">3</div>
-            <div className="step-label">Selecionar Local</div>
+            <div className="step-label">Select Location</div>
           </div>
           <div className="step-arrow">→</div>
           <div className={`step-item ${currentStep >= 4 ? "active" : ""} ${currentStep > 4 ? "completed" : ""}`}>
             <div className="step-number">4</div>
-            <div className="step-label">Ajustar Parâmetros</div>
+            <div className="step-label">Adjust Parameters</div>
           </div>
           <div className="step-arrow">→</div>
           <div className={`step-item ${currentStep >= 5 ? "active" : ""}`}>
             <div className="step-number">5</div>
-            <div className="step-label">Ver Resultados</div>
+            <div className="step-label">View Results</div>
           </div>
         </div>
 
@@ -462,8 +447,8 @@ function App() {
           <div className="section-header">
             <div className="section-number">1</div>
             <div className="section-title">
-              <h2>Buscar Meteoros</h2>
-              <p>Selecione um período de até 7 dias para buscar asteroides próximos à Terra</p>
+              <h2>Search Asteroids</h2>
+              <p>Select a period of up to 7 days to search for near-Earth asteroids</p>
             </div>
           </div>
 
@@ -476,11 +461,11 @@ function App() {
           >
             <div className="date-inputs">
               <div className="date-input-group">
-                <label>Data Inicial</label>
+                <label>Start Date</label>
                 <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} required />
               </div>
               <div className="date-input-group">
-                <label>Data Final</label>
+                <label>End Date</label>
                 <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} required />
               </div>
             </div>
@@ -492,11 +477,11 @@ function App() {
                 checked={hazardousOnly}
                 onChange={(e) => setHazardousOnly(e.target.checked)}
               />
-              <label htmlFor="hazardous-filter">Mostrar apenas asteroides perigosos</label>
+              <label htmlFor="hazardous-filter">Show only hazardous asteroids</label>
             </div>
 
             <button type="submit" className="btn btn-primary" disabled={loading}>
-              {loading ? "🔄 Buscando..." : "🔍 Buscar Meteoros"}
+              {loading ? "🔄 Searching..." : "🔍 Search Asteroids"}
             </button>
           </form>
 
@@ -508,10 +493,9 @@ function App() {
             <div className="section-header">
               <div className="section-number">2</div>
               <div className="section-title">
-                <h2>Escolher Meteoro</h2>
+                <h2>Select Asteroid</h2>
                 <p>
-                  Encontramos {filteredMeteors.length} asteroide{filteredMeteors.length !== 1 ? "s" : ""} no período
-                  selecionado
+                  Found {filteredMeteors.length} asteroid{filteredMeteors.length !== 1 ? "s" : ""} in the selected period
                 </p>
               </div>
             </div>
@@ -584,8 +568,8 @@ function App() {
             <div className="section-header">
               <div className="section-number">3</div>
               <div className="section-title">
-                <h2>Selecionar Local e Ajustar Parâmetros</h2>
-                <p>Clique no mapa para escolher o ponto de impacto e ajuste os parâmetros da simulação</p>
+                <h2>Select Location & Adjust Parameters</h2>
+                <p>Click on the map to choose the impact point and adjust simulation parameters</p>
               </div>
             </div>
 
@@ -593,9 +577,8 @@ function App() {
               <div className="selected-meteor-info">
                 <h4>🌠 {selectedMeteor.name}</h4>
                 <p>
-                  {selectedMeteor.is_potentially_hazardous_asteroid ? "⚠️ Asteroide Perigoso" : "Asteroide Não Perigoso"}{" "}
-                  • Diâmetro:{" "}
-                  {(
+                  {selectedMeteor.is_potentially_hazardous_asteroid ? "⚠️ Hazardous Asteroid" : "Non-Hazardous Asteroid"}{" "}
+                  • Diameter: {(
                     (selectedMeteor.estimated_diameter.meters.estimated_diameter_min +
                       selectedMeteor.estimated_diameter.meters.estimated_diameter_max) /
                     2
@@ -604,7 +587,7 @@ function App() {
                 </p>
               </div>
               <button className="btn btn-secondary" onClick={resetSimulation}>
-                ← Escolher outro meteoro
+                ← Choose another asteroid
               </button>
             </div>
 
@@ -657,24 +640,24 @@ function App() {
 
                 {!selectedLocation ? (
                   <div className="location-info location-info-empty">
-                    👆 Clique no mapa para selecionar o ponto de impacto
+                    👆 Click on the map to select the impact point
                   </div>
                 ) : !populationData ? (
                   <div className="location-info">
-                    📍 Local selecionado: {selectedLocation.lat}°, {selectedLocation.lon}°
+                    📍 Selected location: {selectedLocation.lat}°, {selectedLocation.lon}°
                   </div>
                 ) : (
                   <div className="population-display">
                     <div className="population-header">
-                      <h4>👥 Pessoas Afetadas por Zona</h4>
+                      <h4>👥 People Affected by Zone</h4>
                       <div className="population-meta">
                         <span className="population-source">{populationData.source}</span>
                         <span className={`confidence-badge confidence-${populationData.confidence}`}>
                           {populationData.confidence === "high"
-                            ? "Alta Confiança"
+                            ? "High Confidence"
                             : populationData.confidence === "medium"
-                              ? "Média Confiança"
-                              : "Baixa Confiança"}
+                              ? "Medium Confidence"
+                              : "Low Confidence"}
                         </span>
                       </div>
                     </div>
@@ -682,34 +665,34 @@ function App() {
                       <div className="population-card crater-zone">
                         <div className="population-card-header">
                           <span className="zone-indicator" style={{ background: "#ff0000" }}></span>
-                          <span className="zone-name">{simulationResults.craterRadius == 0 ?  "Explosão Áerea" : "Cratera"}</span> {/* CRATERA2*/}
+                          <span className="zone-name">{simulationResults.craterRadius == 0 ? "Airburst" : "Crater"}</span> {/* CRATERA2*/}
                         </div>
                         <div className="population-count">{populationData.estimates.crater.toLocaleString()}</div>
-                        <div className="population-description">Destruição total</div>
+                        <div className="population-description">Total destruction</div>
                       </div>
                       <div className="population-card severe-zone">
                         <div className="population-card-header">
                           <span className="zone-indicator" style={{ background: "#ff6600" }}></span>
-                          <span className="zone-name">Severa</span>
+                          <span className="zone-name">Severe</span>
                         </div>
                         <div className="population-count">{populationData.estimates.severe.toLocaleString()}</div>
-                        <div className="population-description">Danos estruturais graves</div>
+                        <div className="population-description">Severe structural damage</div>
                       </div>
                       <div className="population-card moderate-zone">
                         <div className="population-card-header">
                           <span className="zone-indicator" style={{ background: "#ffcc00" }}></span>
-                          <span className="zone-name">Moderada</span>
+                          <span className="zone-name">Moderate</span>
                         </div>
                         <div className="population-count">{populationData.estimates.moderate.toLocaleString()}</div>
-                        <div className="population-description">Danos significativos</div>
+                        <div className="population-description">Significant damage</div>
                       </div>
                       <div className="population-card light-zone">
                         <div className="population-card-header">
                           <span className="zone-indicator" style={{ background: "#00ff00" }}></span>
-                          <span className="zone-name">Leve</span>
+                          <span className="zone-name">Light</span>
                         </div>
                         <div className="population-count">{populationData.estimates.light.toLocaleString()}</div>
-                        <div className="population-description">Danos menores</div>
+                        <div className="population-description">Minor damage</div>
                       </div>
                     </div>
                   </div>
@@ -717,16 +700,16 @@ function App() {
               </div>
 
               <aside className="parameters-panel">
-                <h3>⚙️ Parâmetros</h3>
+                <h3>⚙️ Parameters</h3>
 
                 <div className="parameter-group">
                   <div className="parameter-label">
-                    <span>Velocidade</span>
+                    <span>Velocity</span>
                     <span className="parameter-value">{(userVelocity / 1000).toFixed(1)} km/s</span>
                   </div>
                   <input
                     type="range"
-                    min={5000}
+                    min={3000}
                     max={70000}
                     step={500}
                     value={userVelocity}
@@ -736,7 +719,7 @@ function App() {
 
                 <div className="parameter-group">
                   <div className="parameter-label">
-                    <span>Ângulo de entrada</span>
+                    <span>Entry Angle</span>
                     <span className="parameter-value">{userAngle}°</span>
                   </div>
                   <input
@@ -751,7 +734,7 @@ function App() {
 
                 <div className="parameter-group">
                   <div className="parameter-label">
-                    <span>Densidade do Meteoro</span>
+                    <span>Meteor Density</span>
                     <span className="parameter-value">{userDensity} kg/m³</span>
                   </div>
                   <input
@@ -766,11 +749,11 @@ function App() {
 
                 <div className="parameter-group">
                   <div className="parameter-label">
-                    <span>Densidade Populacional</span>
+                    <span>Population Density</span>
                     <span className="parameter-value">
                       {isCustomDensity
-                        ? `${customDensity} pessoas/km²`
-                        : `${densityTemplates[selectedDensityTemplate]} pessoas/km²`}
+                        ? `${customDensity} people/km²`
+                        : `${densityTemplates[selectedDensityTemplate]} people/km²`}
                     </span>
                   </div>
                   <div className="density-templates">
@@ -781,7 +764,7 @@ function App() {
                         className={`density-btn${selectedDensityTemplate === label ? " selected" : ""}`}
                         onClick={() => setSelectedDensityTemplate(label)}
                       >
-                        {label}
+                        {label === "Zona Rural" ? "Rural Area" : label === "Subúrbio" ? "Suburb" : label === "Área Urbana" ? "Urban Area" : label === "Metrópole Densa" ? "Dense Metropolis" : label}
                       </button>
                     ))}
                     <button
@@ -789,7 +772,7 @@ function App() {
                       className={`density-btn${isCustomDensity ? " selected" : ""}`}
                       onClick={() => setSelectedDensityTemplate("Customizado")}
                     >
-                      Customizado
+                      Custom
                     </button>
                   </div>
                   {isCustomDensity && (
@@ -805,7 +788,7 @@ function App() {
                           if (!Number.isNaN(val) && val > 0 && val <= 100000) setCustomDensity(val)
                         }}
                         className="density-input"
-                        placeholder="Digite o valor (pessoas/km²)"
+                        placeholder="Enter value (people/km²)"
                       />
                     </div>
                   )}
@@ -813,36 +796,36 @@ function App() {
 
                 {selectedLocation && simulationResults && (
                   <div className="impact-zones">
-                    <h4>Zonas de Impacto</h4>
+                    <h4>Impact Zones</h4>
                     <div className="zone-item">
                       <div className="zone-label">
                         <span className="zone-color" style={{ background: "#ff0000" }}></span>
-                        Cratera
+                        Crater
                       </div>
                       <span className="zone-value">
                         {simulationResults.craterRadius > 0
-                          ? `${Math.round(simulationResults.craterRadius)} m`
-                          : "Sem cratera (explosão aérea)"}
+                          ? `${Math.round(simulationResults.craterRadius * 2)} m diameter`
+                          : "No crater (airburst)"}
                       </span>
                     </div>
                     <div className="zone-item">
                       <div className="zone-label">
                         <span className="zone-color" style={{ background: "#ff6600" }}></span>
-                        Severa
+                        Severe
                       </div>
                       <span className="zone-value">{Math.round(simulationResults.severeRadius)} m</span>
                     </div>
                     <div className="zone-item">
                       <div className="zone-label">
                         <span className="zone-color" style={{ background: "#ffcc00" }}></span>
-                        Moderada
+                        Moderate
                       </div>
                       <span className="zone-value">{Math.round(simulationResults.moderateRadius)} m</span>
                     </div>
                     <div className="zone-item">
                       <div className="zone-label">
                         <span className="zone-color" style={{ background: "#00ff00" }}></span>
-                        Leve
+                        Light
                       </div>
                       <span className="zone-value">{Math.round(simulationResults.lightRadius)} m</span>
                     </div>
@@ -854,7 +837,7 @@ function App() {
                   onClick={startSimulation}
                   disabled={!selectedLocation}
                 >
-                  🚀 Iniciar Simulação
+                  🚀 Start Simulation
                 </button>
               </aside>
             </div>
@@ -866,84 +849,84 @@ function App() {
             <div className="section-header">
               <div className="section-number">5</div>
               <div className="section-title">
-                <h2>Resultados da Simulação</h2>
-                <p>Análise completa do impacto do asteroide {selectedMeteor.name}</p>
+                <h2>Simulation Results</h2>
+                <p>Complete analysis of the impact of asteroid {selectedMeteor.name}</p>
               </div>
             </div>
 
             <div className="results-grid">
               <div className="result-card highlight">
                 <div className="result-icon">💥</div>
-                <div className="result-label">Energia</div>
+                <div className="result-label">Energy</div>
                 <div className="result-value">{simulationResults.energyMt.toExponential(2)} Mt</div>
               </div>
 
               <div className="result-card">
                 <div className="result-icon">⚖️</div>
-                <div className="result-label">Massa</div>
+                <div className="result-label">Mass</div>
                 <div className="result-value">{Number(simulationResults.mass).toExponential(2)} kg</div>
               </div>
 
               <div className="result-card">
                 <div className="result-icon">📏</div>
-                <div className="result-label">Diâmetro</div>
+                <div className="result-label">Diameter</div>
                 <div className="result-value">{simulationResults.avgDiameter.toFixed(1)} m</div>
               </div>
 
               <div className="result-card">
                 <div className="result-icon">⚡</div>
-                <div className="result-label">Velocidade</div>
+                <div className="result-label">Velocity</div>
                 <div className="result-value">{(simulationResults.velocity / 1000).toFixed(1)} km/s</div>
               </div>
 
               <div className="result-card">
                 <div className="result-icon">🎯</div>
-                <div className="result-label">Ângulo</div>
+                <div className="result-label">Angle</div>
                 <div className="result-value">{simulationResults.angleDeg}°</div>
               </div>
 
               <div className="result-card">
                 <div className="result-icon">🕳️</div>
-                <div className="result-label">Raio da Cratera</div>
+                <div className="result-label">Crater Radius</div>
                 <div className="result-value">
                   {simulationResults.craterRadius > 0
                     ? `${Math.round(simulationResults.craterRadius)} m`
-                    : "Sem cratera (explosão aérea)"}
+                    : "No crater (airburst)"}
                 </div>
               </div>
             </div>
 
             <div className="impact-description">
-              <h4>📊 Análise do Impacto</h4>
+              <h4>📊 Impact Analysis</h4>
               <p>
-                <strong>Energia liberada:</strong> O impacto liberaria aproximadamente{" "}
-                <strong>{simulationResults.energyMt.toExponential(2)} megatons</strong> de energia TNT equivalente.
-                {simulationResults.energyMt > 1 && " Isso é comparável a uma explosão nuclear de grande escala."}
+                <strong>Released energy:</strong> The impact would release approximately{" "}
+                <strong>{simulationResults.energyMt.toExponential(2)} megatons</strong> of TNT equivalent energy.
+                {simulationResults.energyMt > 1 && " This is comparable to a large-scale nuclear explosion."}
               </p>
               <p>
-                <strong>Cratera:</strong> Uma cratera com raio de aproximadamente{" "}
-                <strong>{Math.round(simulationResults.craterRadius)} metros</strong> seria formada no ponto de impacto.
+                <strong>Crater:</strong> A crater with a radius of approximately{" "}
+                <strong>{Math.round(simulationResults.craterRadius)} meters</strong> would be formed at the impact point.
               </p>
               <p>
-                <strong>Zona de destruição severa:</strong> Até{" "}
-                <strong>{Math.round(simulationResults.severeRadius)} metros</strong> do ponto de impacto, haveria
-                destruição quase total de estruturas.
+                <strong>Severe destruction zone:</strong> Up to{" "}
+                <strong>{Math.round(simulationResults.severeRadius)} meters</strong> from the impact point, there would be
+                near-total destruction of structures.
               </p>
               <p>
-                <strong>Zona de danos moderados:</strong> Até{" "}
-                <strong>{Math.round(simulationResults.moderateRadius)} metros</strong>, estruturas sofreriam danos
-                significativos e haveria risco de ferimentos graves.
+                <strong>Moderate damage zone:</strong> Up to{" "}
+                <strong>{Math.round(simulationResults.moderateRadius)} meters</strong>, structures would suffer significant
+                damage and there would be a risk of serious injuries.
               </p>
               <p>
-                <strong>Zona de danos leves:</strong> Até{" "}
-                <strong>{Math.round(simulationResults.lightRadius)} metros</strong>, janelas quebrariam e haveria danos
-                menores a estruturas.
+                <strong>Light damage zone:</strong> Up to{" "}
+                <strong>{Math.round(simulationResults.lightRadius)} meters</strong>, windows would break and there would be
+                minor damage to structures.
               </p>
             </div>
 
             <div style={{ textAlign: "center", marginTop: "2rem" }}>
               <button className="btn btn-primary" onClick={resetSimulation}>
-                🔄 Nova Simulação
+                🔄 New Simulation
               </button>
             </div>
           </section>
@@ -951,10 +934,9 @@ function App() {
       </main>
 
       <footer className="footer">
-        <p>Dados fornecidos pela NASA - Near Earth Object Web Service (NEO)</p>
+        <p>Data provided by NASA - Near Earth Object Web Service (NEO)</p>
         <p className="disclaimer">
-          ⚠️ Esta é uma simulação educacional. Os cálculos são aproximações baseadas em modelos científicos
-          simplificados.
+          ⚠️ This is an educational simulation. Calculations are approximations based on simplified scientific models.
         </p>
       </footer>
     </div>
